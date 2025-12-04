@@ -259,18 +259,71 @@ func TestExpBackoffRetryPolicyEdgeCases(t *testing.T) {
 	})
 
 	t.Run("NoRetries with ExpBackoffRetryPolicy", func(t *testing.T) {
-		// ExpBackoffRetryPolicy doesn't have NoRetries logic, but testing
-		// with RetryLimit=0 to see behavior
 		policy := &ExpBackoffRetryPolicy{
-			RetryLimit: 0,
+			RetryLimit: NoRetries,
+			BaseDelay:  1 * time.Second,
+			MaxDelay:   5 * time.Second,
+		}
+		// NoRetries should fail immediately without any retries
+		assertDelays(t, policy, []time.Duration{})
+
+		// Verify the error is returned on first call
+		rf := policy.NewRetry()
+		testErr := errors.New("test error")
+		delay, err := rf(testErr)
+		if err == nil {
+			t.Error("expected error on first call with NoRetries, got nil")
+		}
+		if delay != 0 {
+			t.Errorf("expected delay 0, got %v", delay)
+		}
+	})
+
+	t.Run("UnlimitedRetries with ExpBackoffRetryPolicy", func(t *testing.T) {
+		policy := &ExpBackoffRetryPolicy{
+			RetryLimit: UnlimitedRetries,
+			BaseDelay:  10 * time.Millisecond,
+			MaxDelay:   100 * time.Millisecond,
+		}
+
+		// Test that UnlimitedRetries continues beyond any reasonable limit
+		rf := policy.NewRetry()
+		testErr := errors.New("test error")
+
+		// Try 100 retries - should all succeed with no error
+		// Delays should follow exponential backoff until capped at MaxDelay
+		for i := 0; i < 100; i++ {
+			delay, err := rf(testErr)
+			if err != nil {
+				t.Fatalf("unexpected error at retry %d: %v", i, err)
+			}
+			// After a few retries, delay should be capped at MaxDelay
+			if i < 4 {
+				// For the first few retries, check exact exponential values
+				expectedDelay := (10 * time.Millisecond) << i
+				if delay != expectedDelay {
+					t.Errorf("wrong delay at retry %d: expected %v, got %v", i, expectedDelay, delay)
+				}
+			} else {
+				// After that, should be capped at MaxDelay
+				if delay != 100*time.Millisecond {
+					t.Errorf("wrong delay at retry %d: expected 100ms (capped), got %v", i, delay)
+				}
+			}
+		}
+	})
+
+	t.Run("negative RetryLimit with ExpBackoffRetryPolicy", func(t *testing.T) {
+		policy := &ExpBackoffRetryPolicy{
+			RetryLimit: -5,
 			BaseDelay:  1 * time.Second,
 			MaxDelay:   5 * time.Second,
 		}
 		rf := policy.NewRetry()
-		// With RetryLimit=0, first call should fail
-		_, err := rf(nil)
+		_, err := rf(errors.New("test"))
+		// Should fail immediately like NoRetries
 		if err == nil {
-			t.Error("expected error with RetryLimit=0 on ExpBackoffRetryPolicy, got nil")
+			t.Error("expected error for negative RetryLimit, got nil")
 		}
 	})
 }

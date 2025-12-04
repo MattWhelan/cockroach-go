@@ -148,9 +148,13 @@ func (l *LimitBackoffRetryPolicy) NewRetry() RetryFunc {
 // This prevents excessive wait times during high retry counts and provides a
 // predictable upper bound for backoff duration.
 //
-// The policy will retry up to RetryLimit times. When the limit is exceeded or
-// if the delay calculation overflows without a MaxDelay set, it returns a
-// MaxRetriesExceededError.
+// The RetryLimit field controls retry behavior:
+//   - Positive value (e.g., 10): Retry up to that many times before failing
+//   - UnlimitedRetries (0): Retry indefinitely until success or non-retryable error
+//   - NoRetries (-1) or any negative value: Do not retry; fail immediately on first retryable error
+//
+// When the limit is exceeded or if the delay calculation overflows without a
+// MaxDelay set, it returns a MaxRetriesExceededError.
 //
 // Example usage with capped exponential backoff:
 //
@@ -180,8 +184,10 @@ func (l *LimitBackoffRetryPolicy) NewRetry() RetryFunc {
 // Note: Setting MaxDelay to 0 means no cap, but be aware that delay overflow
 // will cause the policy to fail early.
 type ExpBackoffRetryPolicy struct {
-	// RetryLimit is the maximum number of retries allowed. After this many
-	// retries, a MaxRetriesExceededError is returned.
+	// RetryLimit controls the retry behavior:
+	//   - Positive value: Maximum number of retries before returning MaxRetriesExceededError
+	//   - UnlimitedRetries (0): Retry indefinitely
+	//   - NoRetries (-1) or any negative value: Do not retry, fail immediately
 	RetryLimit int
 
 	// BaseDelay is the initial delay before the first retry. Each subsequent
@@ -199,7 +205,13 @@ func (l *ExpBackoffRetryPolicy) NewRetry() RetryFunc {
 	tryCount := 0
 	return func(err error) (time.Duration, error) {
 		tryCount++
-		if tryCount > l.RetryLimit {
+		// Any negative value (including NoRetries) means fail immediately
+		if l.RetryLimit < UnlimitedRetries {
+			return 0, newMaxRetriesExceededError(err, 0)
+		}
+		// UnlimitedRetries (0) means retry indefinitely, so skip the limit check
+		// Any positive value enforces the retry limit
+		if l.RetryLimit > UnlimitedRetries && tryCount > l.RetryLimit {
 			return 0, newMaxRetriesExceededError(err, l.RetryLimit)
 		}
 		delay := l.BaseDelay << (tryCount - 1)
@@ -219,19 +231,20 @@ func (l *ExpBackoffRetryPolicy) NewRetry() RetryFunc {
 	}
 }
 
-// Vargo adapts third-party backoff strategies (like those from github.com/sethvargo/go-retry)
+// ExternalBackoffPolicy adapts third-party backoff strategies
+// (like those from github.com/sethvargo/go-retry)
 // into a RetryPolicy without creating a direct dependency on those libraries.
 //
 // This function allows you to use any backoff implementation that conforms to the
-// VargoBackoff interface, providing flexibility to integrate external retry strategies
+// ExternalBackoff interface, providing flexibility to integrate external retry strategies
 // with CockroachDB transaction retries.
 //
 // Example usage with a hypothetical external backoff library:
 //
-//	import "github.com/sethvargo/go-retry"
+//	import retry "github.com/sethvargo/go-retry"
 //
 //	// Create a retry policy using an external backoff strategy
-//	policy := crdb.Vargo(func() crdb.VargoBackoff {
+//	policy := crdb.ExternalBackoffPolicy(func() crdb.ExternalBackoff {
 //	    // Fibonacci backoff: 1s, 1s, 2s, 3s, 5s, 8s...
 //	    return retry.NewFibonacci(1 * time.Second)
 //	})
@@ -240,15 +253,15 @@ func (l *ExpBackoffRetryPolicy) NewRetry() RetryFunc {
 //	    // transaction logic
 //	})
 //
-// The function parameter should return a fresh VargoBackoff instance for each
+// The function parameter should return a fresh ExternalBackoff instance for each
 // transaction, as backoff state is not safe for concurrent use.
-func Vargo(fn func() VargoBackoff) RetryPolicy {
-	return &vargoAdapter{
+func ExternalBackoffPolicy(fn func() ExternalBackoff) RetryPolicy {
+	return &externalBackoffAdapter{
 		DelegateFactory: fn,
 	}
 }
 
-// VargoBackoff is an interface for external backoff strategies that provide
+// ExternalBackoff is an interface for external backoff strategies that provide
 // delays through a Next() method. This allows adaptation of backoff policies
 // from libraries like github.com/sethvargo/go-retry without creating a direct
 // dependency.
@@ -256,21 +269,21 @@ func Vargo(fn func() VargoBackoff) RetryPolicy {
 // Next returns the next backoff duration and a boolean indicating whether to
 // stop retrying. When stop is true, the retry loop terminates with a
 // MaxRetriesExceededError.
-type VargoBackoff interface {
+type ExternalBackoff interface {
 	// Next returns the next delay duration and whether to stop retrying.
 	// When stop is true, no more retries will be attempted.
 	Next() (next time.Duration, stop bool)
 }
 
-// vargoAdapter adapts backoff policies in the style of github.com/sethvargo/go-retry.
-type vargoAdapter struct {
-	DelegateFactory func() VargoBackoff
+// externalBackoffAdapter adapts backoff policies in the style of github.com/sethvargo/go-retry.
+type externalBackoffAdapter struct {
+	DelegateFactory func() ExternalBackoff
 }
 
 // NewRetry implements RetryPolicy by delegating to the external backoff strategy.
 // It creates a fresh backoff instance using DelegateFactory and wraps its Next()
 // method to conform to the RetryFunc signature.
-func (b *vargoAdapter) NewRetry() RetryFunc {
+func (b *externalBackoffAdapter) NewRetry() RetryFunc {
 	delegate := b.DelegateFactory()
 	count := 0
 	return func(err error) (time.Duration, error) {
